@@ -286,7 +286,11 @@ def _convert_depth(out, inp, row_num, ss_bid, ss_ask, snapshot_mode):
                     out[row_num].ev = DEPTH_CLEAR_EVENT | BUY_EVENT
                     out[row_num].exch_ts = ss_bid[0].exch_ts
                     out[row_num].local_ts = ss_bid[0].local_ts
-                    out[row_num].px = ss_bid[ss_bid_rn - 1].px
+                    # A Tardis snapshot is the whole book, so clear the whole side (clear_depth
+                    # clears everything for a non-finite price). Clearing only down to the last
+                    # snapshot row misses levels the feed never deleted, including ones the depth
+                    # hid below its best when a crossing update moved the best past them.
+                    out[row_num].px = np.nan
                     out[row_num].qty = 0
                     out[row_num].order_id = 0
                     out[row_num].ival = 0
@@ -300,7 +304,7 @@ def _convert_depth(out, inp, row_num, ss_bid, ss_ask, snapshot_mode):
                     out[row_num].ev = DEPTH_CLEAR_EVENT | SELL_EVENT
                     out[row_num].exch_ts = ss_ask[0].exch_ts
                     out[row_num].local_ts = ss_ask[0].local_ts
-                    out[row_num].px = ss_ask[ss_ask_rn - 1].px
+                    out[row_num].px = np.nan
                     out[row_num].qty = 0
                     out[row_num].order_id = 0
                     out[row_num].ival = 0
