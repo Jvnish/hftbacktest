@@ -278,8 +278,12 @@ where
                 wait_resp_order_received = true;
             }
 
-            // Processes receiving order response (full and partial fills).
-            if order.status == Status::Filled || order.status == Status::PartiallyFilled {
+            // Processes receiving order response (full and partial fills). A rejected
+            // cancel or modify echoes the local order as it was when the request was
+            // sent, so a partially filled order would carry its last fill again.
+            if (order.status == Status::Filled || order.status == Status::PartiallyFilled)
+                && order.req != Status::Rejected
+            {
                 self.state.apply_fill(&order);
             }
             // Applies the received order response to the local orders.
