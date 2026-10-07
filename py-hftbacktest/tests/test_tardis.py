@@ -2,6 +2,8 @@ import os
 import tempfile
 import unittest
 
+import numpy as np
+
 from hftbacktest.data.utils import tardis
 from hftbacktest.types import DEPTH_CLEAR_EVENT, DEPTH_SNAPSHOT_EVENT, BUY_EVENT, SELL_EVENT
 
@@ -13,7 +15,7 @@ def _row(ts, is_snapshot, side, px, qty):
 class TestTardisConvert(unittest.TestCase):
     def test_later_snapshot_larger_than_first(self):
         # The second snapshot has more levels than the first one. All of its levels must be kept, and the clear events
-        # must cover its full price range.
+        # must clear the whole side.
         rows = [
             _row(1000, 'true', 'bid', 100.0, 1),
             _row(1000, 'true', 'bid', 99.0, 1),
@@ -50,8 +52,11 @@ class TestTardisConvert(unittest.TestCase):
         clear = second[(second['ev'] & DEPTH_CLEAR_EVENT) == DEPTH_CLEAR_EVENT]
         bid_clear = clear[(clear['ev'] & BUY_EVENT) == BUY_EVENT]
         ask_clear = clear[(clear['ev'] & SELL_EVENT) == SELL_EVENT]
-        self.assertEqual(bid_clear['px'].tolist(), [98.0])
-        self.assertEqual(ask_clear['px'].tolist(), [104.0])
+        # Each side is cleared whole (NaN price) so levels the feed never deleted cannot
+        # outlive the snapshot, wherever they sit relative to its price range.
+        self.assertEqual(len(bid_clear), 1)
+        self.assertEqual(len(ask_clear), 1)
+        self.assertTrue(np.isnan(bid_clear['px'][0]) and np.isnan(ask_clear['px'][0]))
 
 
 if __name__ == '__main__':
