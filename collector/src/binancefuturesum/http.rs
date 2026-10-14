@@ -8,15 +8,20 @@ use anyhow::Error;
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use tokio::{
+    net::TcpStream,
     select,
     sync::mpsc::{UnboundedSender, unbounded_channel},
     time::interval,
 };
 use tokio_tungstenite::{
-    connect_async,
+    MaybeTlsStream, WebSocketStream, client_async_tls, connect_async,
     tungstenite::{Bytes, Message, Utf8Bytes, client::IntoClientRequest},
 };
-use tracing::{error, warn};
+use tracing::{error, info, warn};
+
+use crate::proxy;
+
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub async fn fetch_symbol_list() -> Result<Vec<String>, reqwest::Error> {
     Ok(reqwest::Client::new()
@@ -55,12 +60,29 @@ pub async fn fetch_depth_snapshot(symbol: &str) -> Result<String, reqwest::Error
         .await
 }
 
+async fn open(url: &str) -> Result<WsStream, Error> {
+    let request = url.into_client_request()?;
+    let host = request
+        .uri()
+        .host()
+        .ok_or_else(|| anyhow::anyhow!("no host in {url}"))?
+        .to_string();
+    let port = request.uri().port_u16().unwrap_or(443);
+    let (ws_stream, _) = match proxy::proxy_for(&host)? {
+        Some(proxy) => {
+            let stream = proxy::tunnel(&proxy, &host, port).await?;
+            client_async_tls(request, stream).await?
+        }
+        None => connect_async(request).await?,
+    };
+    Ok(ws_stream)
+}
+
 pub async fn connect(
     url: &str,
     ws_tx: UnboundedSender<(DateTime<Utc>, Utf8Bytes)>,
 ) -> Result<(), anyhow::Error> {
-    let request = url.into_client_request()?;
-    let (ws_stream, _) = connect_async(request).await?;
+    let ws_stream = open(url).await?;
     let (mut write, mut read) = ws_stream.split();
     let (tx, mut rx) = unbounded_channel::<Bytes>();
 
@@ -130,6 +152,14 @@ pub async fn keep_connection(
     symbol_list: Vec<String>,
     ws_tx: UnboundedSender<(DateTime<Utc>, Utf8Bytes)>,
 ) {
+    match proxy::proxy_for("fstream.binance.com") {
+        Ok(Some(proxy)) => info!(
+            proxy = %format!("{}:{}", proxy.host, proxy.port),
+            "connecting through an HTTP proxy"
+        ),
+        Ok(None) => info!("connecting directly"),
+        Err(error) => error!(?error, "invalid proxy setting"),
+    }
     let mut error_count = 0;
     loop {
         let connect_time = Instant::now();

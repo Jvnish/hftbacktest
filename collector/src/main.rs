@@ -19,6 +19,7 @@ mod bybit;
 mod error;
 mod file;
 mod hyperliquid;
+mod proxy;
 mod throttler;
 
 #[derive(Parser, Debug)]
