@@ -42,6 +42,15 @@ struct Args {
     /// Seconds between flushes of the open segments; a killed process loses at most this much.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..))]
     flush_secs: u64,
+
+    /// binancefutures only: seconds between scheduled depth snapshots, aligned like
+    /// --rotate-secs. 0 disables them; snapshots are still taken at startup and after gaps.
+    #[arg(long, default_value_t = 3600)]
+    snapshot_secs: u64,
+
+    /// binancefutures only: reconnect when a connection delivers no data for this many seconds.
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+    idle_timeout_secs: u64,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -54,20 +63,24 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let _handle = match args.exchange.as_str() {
         "binancefutures" | "binancefuturesum" => {
-            let streams = [
-                "$symbol@trade",
-                "$symbol@bookTicker",
-                "$symbol@depth@0ms",
-                // "$symbol@@markPrice@1s"
-            ]
-            .iter()
-            .map(|stream| stream.to_string())
-            .collect();
+            let public_streams = ["$symbol@trade", "$symbol@bookTicker", "$symbol@depth@0ms"]
+                .iter()
+                .map(|stream| stream.to_string())
+                .collect();
+            let market_streams = ["$symbol@markPrice@1s"]
+                .iter()
+                .map(|stream| stream.to_string())
+                .collect();
 
             tokio::spawn(binancefuturesum::run_collection(
-                streams,
+                public_streams,
+                market_streams,
                 args.symbols,
                 writer_tx,
+                binancefuturesum::Config {
+                    snapshot_secs: args.snapshot_secs,
+                    idle_timeout: Duration::from_secs(args.idle_timeout_secs),
+                },
             ))
         }
         "binancefuturescm" => {
