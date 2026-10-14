@@ -201,7 +201,14 @@ where
         }
 
         let est_front = front - (1.0 - prob) * chg + (back - prob * chg).min(0.0);
-        q.front_q_qty = est_front.min(new_qty);
+        // The share put ahead, (1 - prob) * chg, can exceed the quantity ahead when the
+        // probability weights the front above its proportional share, front / (front + back):
+        // PowerProbQueueFunc and PowerProbQueueFunc2 with n > 1 when front > back,
+        // LogProbQueueFunc when front < back. What the front cannot absorb was cancelled behind
+        // the order, as the back's overflow above is moved to the front. Left negative, the
+        // estimate would be paid out by the next trade at the price as an execution beyond that
+        // trade's quantity. A remainder that trades already took below zero is kept.
+        q.front_q_qty = est_front.min(new_qty).max(front.min(0.0));
     }
 
     fn is_filled(&self, order: &mut Order, depth: &MD) -> f64 {
@@ -1362,5 +1369,117 @@ mod l3_tests {
                 &qm, 1
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod prob_tests {
+    use crate::{
+        backtest::models::{
+            LogProbQueueFunc,
+            PowerProbQueueFunc,
+            PowerProbQueueFunc2,
+            ProbQueueModel,
+            Probability,
+            QueueModel,
+        },
+        depth::{HashMapMarketDepth, L2MarketDepth},
+        types::{OrdType, Order, Side, TimeInForce},
+    };
+
+    const TICK: f64 = 0.1;
+    const LOT: f64 = 0.01;
+
+    /// A 1.0 bid joined at 100.0 behind `ahead`, with `behind` joining after it.
+    fn joined<P: Probability>(
+        prob: P,
+        ahead: f64,
+        behind: f64,
+    ) -> (
+        ProbQueueModel<P, HashMapMarketDepth>,
+        HashMapMarketDepth,
+        Order,
+    ) {
+        let qm = ProbQueueModel::new(prob);
+        let mut depth = HashMapMarketDepth::new(TICK, LOT);
+        depth.update_bid_depth(100.0, ahead, 0);
+        let mut order = Order::new(
+            1,
+            1000,
+            TICK,
+            1.0,
+            Side::Buy,
+            OrdType::Limit,
+            TimeInForce::GTX,
+        );
+        qm.new_order(&mut order, &depth);
+        qm.depth(&mut order, ahead, ahead + behind, &depth);
+        (qm, depth, order)
+    }
+
+    /// What a `print` at the price executes after the level shrinks to `left` with no trade.
+    fn exec_after_decrease<P: Probability>(
+        prob: P,
+        ahead: f64,
+        behind: f64,
+        left: f64,
+        print: f64,
+    ) -> f64 {
+        let (qm, depth, mut order) = joined(prob, ahead, behind);
+        qm.depth(&mut order, ahead + behind, left, &depth);
+        qm.trade(&mut order, print, &depth);
+        qm.is_filled(&mut order, &depth)
+    }
+
+    /// A decrease put ahead of the order beyond what is ahead of it must not leave the queue
+    /// ahead negative, or the next print pays the deficit out on top of its own quantity. A 0.01
+    /// print executed 0.59, 0.70, 0.53 and 0.86 here before the fix.
+    #[test]
+    fn decrease_does_not_overdraw_the_queue_ahead() {
+        // front > back: the power functions with n > 1 weight the front above its share.
+        assert_eq!(
+            exec_after_decrease(PowerProbQueueFunc::new(2.0), 10.0, 2.0, 1.0, 0.01),
+            0.01
+        );
+        assert_eq!(
+            exec_after_decrease(PowerProbQueueFunc2::new(2.0), 10.0, 2.0, 1.0, 0.01),
+            0.01
+        );
+        // front < back: PowerProbQueueFunc2 and the log function do.
+        assert_eq!(
+            exec_after_decrease(PowerProbQueueFunc2::new(2.0), 1.0, 9.0, 2.0, 0.01),
+            0.01
+        );
+        assert_eq!(
+            exec_after_decrease(LogProbQueueFunc::new(), 1.0, 9.0, 2.0, 0.01),
+            0.01
+        );
+    }
+
+    /// A decrease the front can absorb advances the queue as before: 10 ahead, 2 behind, 6
+    /// cancelled leaves 10 - 6 * 100 / 104 = 4.23 ahead, so a 4.3 print executes 0.07.
+    #[test]
+    fn decrease_within_the_queue_ahead_is_unchanged() {
+        assert_eq!(
+            exec_after_decrease(PowerProbQueueFunc::new(2.0), 10.0, 2.0, 6.0, 4.0),
+            0.0
+        );
+        assert_eq!(
+            exec_after_decrease(PowerProbQueueFunc::new(2.0), 10.0, 2.0, 6.0, 4.3),
+            0.07
+        );
+    }
+
+    /// A trade that passes the order by less than half a lot leaves the queue ahead slightly
+    /// negative without an execution; a later decrease keeps that remainder rather than resetting
+    /// it to zero, so the next 0.003 print still completes a lot (0.004 + 0.003).
+    #[test]
+    fn decrease_keeps_a_trade_remainder() {
+        let (qm, depth, mut order) = joined(PowerProbQueueFunc::new(2.0), 1.0, 5.0);
+        qm.trade(&mut order, 1.004, &depth);
+        assert_eq!(qm.is_filled(&mut order, &depth), 0.0);
+        qm.depth(&mut order, 6.0, 2.0, &depth);
+        qm.trade(&mut order, 0.003, &depth);
+        assert_eq!(qm.is_filled(&mut order, &depth), 0.01);
     }
 }
