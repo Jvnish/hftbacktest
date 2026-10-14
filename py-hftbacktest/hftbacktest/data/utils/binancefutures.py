@@ -275,8 +275,12 @@ def convert(
                     asks = message['asks']
                     exch_timestamp = int(transaction_time) * timestamp_mul
                     if len(bids) > 0:
-                        bid_clear_upto = float(bids[-1][0])
-                        # clears the existing market depth upto the prices in the snapshot.
+                        # Clears the whole side (clear_depth clears everything for a non-finite price). Clearing only
+                        # down to the last snapshot level kept levels the feed never deleted outside that range,
+                        # including ones the depth hid behind its best when a crossing update moved the best past
+                        # them. Levels beyond the snapshot's depth (1000 from the collector) come back with later
+                        # diffs, as in Binance's local order book procedure.
+                        bid_clear_upto = np.nan
                         tmp[row_num] = (
                             DEPTH_CLEAR_EVENT | BUY_EVENT,
                             exch_timestamp,
@@ -302,8 +306,7 @@ def convert(
                             )
                             row_num += 1
                     if len(asks) > 0:
-                        ask_clear_upto = float(asks[-1][0])
-                        # clears the existing market depth upto the prices in the snapshot.
+                        ask_clear_upto = np.nan
                         tmp[row_num] = (
                             DEPTH_CLEAR_EVENT | SELL_EVENT,
                             exch_timestamp,
