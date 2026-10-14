@@ -1,6 +1,7 @@
 import gzip
 import json
-from typing import Optional, Literal
+import os
+from typing import Optional, Literal, Sequence, Union
 
 import numpy as np
 from numpy.typing import NDArray
@@ -17,8 +18,49 @@ from ...types import (
 )
 
 
+class _SegmentReader:
+    """
+    Reads the lines of one or more gzip files in order.
+
+    A file that ends without a gzip trailer (the collector was killed) or with a partial last line yields the complete
+    lines before the truncation, with a warning, and reading continues with the next file. Concatenating such a file
+    with ``cat`` instead would corrupt every file after it.
+    """
+
+    def __init__(self, filenames: Sequence[str]):
+        self._filenames = list(filenames)
+        self._file = None
+
+    def readline(self) -> bytes:
+        while True:
+            if self._file is None:
+                if not self._filenames:
+                    return b''
+                self._filename = self._filenames.pop(0)
+                self._file = gzip.open(self._filename, 'r')
+            try:
+                line = self._file.readline()
+            except EOFError:
+                print('%s is truncated; keeping the lines before the truncation' % self._filename)
+                line = b''
+            if line and not line.endswith(b'\n'):
+                print('%s ends with a partial line; skipping it' % self._filename)
+                line = b''
+            if line:
+                return line
+            self._file.close()
+            self._file = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        if self._file is not None:
+            self._file.close()
+
+
 def convert(
-        input_filename: str,
+        input_filename: Union[str, os.PathLike, Sequence[Union[str, os.PathLike]]],
         output_filename: Optional[str] = None,
         opt: Literal['', 'm', 't', 'mt'] = '',
         base_latency: float = 0,
@@ -45,8 +87,12 @@ def convert(
         1660228023138740 {"stream":"btcusdt@depth@0ms","data":{"e":"depthUpdate","E":1660228024077,"T":1660228024066,"s":"BTCUSDT","U":1801732836639,"u":1801732837803,"pu":1801732836571,"b":[["2467.10","0.000"],["24659.00","0.000"],["24659.30","2.500"],["24663.00","1.038"],["24664.20","0.118"],["24666.20","7.065"],["24666.50","0.554"],["24666.70","3.987"],["24666.80","7.088"],["24666.90","0.014"],["24667.40","1.506"],["24668.90","0.006"],["24670.10","0.272"],["24670.90","6.726"],["24688.30","0.000"]],"a":[["24653.60","0.000"],["24668.70","0.000"],["24670.30","0.000"],["24670.50","0.000"],["24670.90","0.000"],["24679.00","0.001"],["24703.10","1.500"],["24710.50","0.057"],["24728.30","0.028"],["24768.50","0.318"],["24980.10","5.446"],["25050.00","119.300"]]}}
         1660228023149748 {"stream":"btcusdt@trade","data":{"e":"trade","E":1660228024088,"T":1660228024081,"s":"BTCUSDT","t":2691833667,"p":"24671.00","q":"0.063","X":"MARKET","m":false}}
 
+    Lines whose event type is not handled, such as the collector's ``collectorEvent`` connection markers, are skipped.
+
     Args:
-        input_filename: Input filename with path.
+        input_filename: Input filename with path, or a list of files read in order, such as the hourly segments of a
+                        day written by the collector. A file truncated by a killed collector contributes the lines
+                        before the truncation.
         output_filename: If provided, the converted data will be saved to the specified filename in ``npz`` format.
         opt: Additional processing options:
 
@@ -79,9 +125,14 @@ def convert(
     timestamp_slice = 19
     timestamp_mul = 1000000
 
+    if isinstance(input_filename, (str, os.PathLike)):
+        input_filenames = [input_filename]
+    else:
+        input_filenames = list(input_filename)
+
     tmp = np.empty(buffer_size, event_dtype)
     row_num = 0
-    with gzip.open(input_filename, 'r') as f:
+    with _SegmentReader(input_filenames) as f:
         while True:
             line = f.readline()
             if not line:
@@ -142,13 +193,14 @@ def convert(
                         )
                         row_num += 1
                 elif evt == 'markPriceUpdate' and 'm' in opt:
-                    # event_time = data['E']
-                    transaction_time = data['T']
+                    # In markPriceUpdate, T is the next funding time, hours ahead of the event. Using it as the exchange
+                    # timestamp made correct_local_timestamp shift every local timestamp in the file by hours.
+                    event_time = data['E']
                     index = data['i']
                     mark_price = data['p']
                     # est_settle_price = data['P']
                     funding_rate = data['r']
-                    exch_timestamp = int(transaction_time) * timestamp_mul
+                    exch_timestamp = int(event_time) * timestamp_mul
                     tmp[row_num] = (
                         100,
                         exch_timestamp,
