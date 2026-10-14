@@ -1,6 +1,6 @@
 [package]
 name = "py-hftbacktest"
-version = "2.4.4+sean.4"
+version = "2.4.4+sean.5"
 edition = "2024"
 
 [lib]
