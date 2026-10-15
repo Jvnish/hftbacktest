@@ -1,7 +1,7 @@
 import gzip
 import json
 import os
-from typing import Optional, Literal, Sequence, Union
+from typing import Optional, Sequence, Union
 
 import numpy as np
 from numpy.typing import NDArray
@@ -16,6 +16,9 @@ from ...types import (
     SELL_EVENT,
     event_dtype
 )
+
+#: Custom event kind for fills of RPI (Retail Price Improvement) maker orders, written with ``opt`` containing ``'r'``.
+RPI_TRADE_EVENT = 105
 
 
 class _SegmentReader:
@@ -62,7 +65,7 @@ class _SegmentReader:
 def convert(
         input_filename: Union[str, os.PathLike, Sequence[Union[str, os.PathLike]]],
         output_filename: Optional[str] = None,
-        opt: Literal['', 'm', 't', 'mt'] = '',
+        opt: str = '',
         base_latency: float = 0,
         combined_stream: bool = True,
         buffer_size: int = 100_000_000
@@ -107,6 +110,16 @@ def convert(
                 - best bid: ``103``
                 - best ask: ``104``
 
+             - ``r``: Keeps trades with ``X == 'RPI'`` as custom event ID ``105`` (:data:`RPI_TRADE_EVENT`), with
+               ``BUY_EVENT``/``SELL_EVENT`` set to the taker's side as for trades. These are fills of Retail Price
+               Improvement maker orders, which are hidden from the order book and match only App/Web taker orders.
+               Event kinds are compared exactly, so the exchange models and queue models never see them: they do
+               not fill simulated orders or move queue positions. The exchange-side and local-side sequences of
+               all other events are unchanged, though :func:`.correct_event_order` may split some of them into
+               separate exchange and local rows.
+
+             Options combine, e.g. ``'mtr'``.
+
         base_latency: The value to be added to the feed latency.
                       See :func:`.correct_local_timestamp`.
         combined_stream: Raw stream type.
@@ -146,7 +159,12 @@ def convert(
             if data is not None:
                 evt = data['e']
                 if evt == 'trade':
-                    if data['X'] != 'MARKET':
+                    if data['X'] == 'MARKET':
+                        trade_event = TRADE_EVENT
+                    elif data['X'] == 'RPI' and 'r' in opt:
+                        trade_event = RPI_TRADE_EVENT
+                    else:
+                        # NA and INSURANCE_FUND rows carry zero price and quantity; RPI fills are dropped without 'r'.
                         continue
                     # event_time = data['E']
                     transaction_time = data['T']
@@ -154,7 +172,7 @@ def convert(
                     qty = data['q']
                     exch_timestamp = int(transaction_time) * timestamp_mul
                     tmp[row_num] = (
-                        TRADE_EVENT | (SELL_EVENT if data['m'] else BUY_EVENT), # trade initiator's side
+                        trade_event | (SELL_EVENT if data['m'] else BUY_EVENT), # trade initiator's side
                         exch_timestamp,
                         local_timestamp,
                         float(price),

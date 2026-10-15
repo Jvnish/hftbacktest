@@ -7,9 +7,11 @@ import zlib
 
 import numpy as np
 
-from hftbacktest import BacktestAsset, HashMapMarketDepthBacktest
+from hftbacktest import BacktestAsset, HashMapMarketDepthBacktest, GTC, LIMIT
 from hftbacktest.data.utils import binancefutures
-from hftbacktest.types import DEPTH_EVENT, DEPTH_CLEAR_EVENT, DEPTH_SNAPSHOT_EVENT, TRADE_EVENT, BUY_EVENT, SELL_EVENT
+from hftbacktest.types import (
+    DEPTH_EVENT, DEPTH_CLEAR_EVENT, DEPTH_SNAPSHOT_EVENT, TRADE_EVENT, BUY_EVENT, SELL_EVENT, EXCH_EVENT, LOCAL_EVENT
+)
 
 # The converter reads 19-digit nanosecond receipt timestamps.
 BASE_MS = 1_791_000_000_000
@@ -43,6 +45,17 @@ MARK_PRICE = _line(1012, {
     'data': {'e': 'markPriceUpdate', 'E': BASE_MS + 1004, 'T': BASE_MS + 1000 + HOURS_3_MS, 's': 'BTCUSDT',
              'p': '100.5', 'i': '100.4', 'P': '100.45', 'r': '0.0001'}
 })
+
+
+def _sides(data):
+    """The event sequences the exchange and the local processor see, without RPI rows and without side flags."""
+    data = data[(data['ev'] & 0xff) != binancefutures.RPI_TRADE_EVENT]
+    sequences = []
+    for flag in (EXCH_EVENT, LOCAL_EVENT):
+        side = data[(data['ev'] & flag) == flag].copy()
+        side['ev'] &= ~np.uint64(EXCH_EVENT | LOCAL_EVENT)
+        sequences.append(side.tobytes())
+    return sequences
 
 
 def _trade(recv_ms, ms, px):
@@ -149,6 +162,65 @@ class TestBinanceFuturesConvert(unittest.TestCase):
             self.assertEqual(hbt.depth(0).best_bid, 100.0)
             self.assertTrue(np.isnan(hbt.depth(0).best_ask))
             hbt.close()
+
+    def test_rpi_trades_are_kept_without_changing_fills(self):
+        # An App/Web taker sells into a hidden RPI bid at 99.5, below the visible bid and below our 100.5 bid. As a
+        # trade it would fill our bid; as an RPI event it must not. The MARKET sell at 100.0 then fills it.
+        def trade(recv_ms, tid, px, qty, x):
+            return _line(recv_ms, {
+                'stream': 'btcusdt@trade',
+                'data': {'e': 'trade', 'E': BASE_MS + recv_ms - 4, 'T': BASE_MS + recv_ms - 5, 's': 'BTCUSDT',
+                         't': tid, 'p': px, 'q': qty, 'X': x, 'm': True}
+            })
+
+        def run(lines, opt):
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                filename = os.path.join(tmp_dir, 'btcusdt_20261015_000000.gz')
+                with gzip.open(filename, 'wb') as f:
+                    f.write(lines)
+                npz = os.path.join(tmp_dir, 'btcusdt.npz')
+                data = binancefutures.convert(filename, output_filename=npz, opt=opt, buffer_size=100)
+                asset = (
+                    BacktestAsset()
+                    .data([npz])
+                    .linear_asset(1.0)
+                    .constant_order_latency(0, 0)
+                    .risk_adverse_queue_model()
+                    .no_partial_fill_exchange()
+                    .trading_value_fee_model(0.0, 0.0)
+                    .tick_size(0.5)
+                    .lot_size(0.001)
+                )
+                hbt = HashMapMarketDepthBacktest([asset])
+                hbt.elapse(1)
+                hbt.elapse(_ns(1500) - hbt.current_timestamp)
+                hbt.submit_buy_order(0, 1, 100.5, 1.0, GTC, LIMIT, False)
+                positions = []
+                for ms in (2500, 3500):
+                    hbt.elapse(_ns(ms) - hbt.current_timestamp)
+                    positions.append(hbt.position(0))
+                hbt.close()
+            return data, positions
+
+        def tail(x):
+            return trade(2005, 1, '99.5', '0.5', x) + trade(2105, 2, '0', '0', 'NA') + trade(3005, 3, '100.0', '2', 'MARKET')
+
+        plain, plain_positions = run(SNAPSHOT + tail('RPI'), '')
+        kept, kept_positions = run(SNAPSHOT + tail('RPI'), 'r')
+        _, as_trade_positions = run(SNAPSHOT + tail('MARKET'), '')
+
+        kind = kept['ev'] & 0xff
+        rpi = kept[kind == binancefutures.RPI_TRADE_EVENT]
+        self.assertEqual(len(rpi), 1)
+        self.assertEqual((rpi['px'][0], rpi['qty'][0]), (99.5, 0.5))
+        self.assertTrue(rpi['ev'][0] & SELL_EVENT)
+        # Without the RPI rows, the exchange and the local processor see exactly the events of the default conversion.
+        # Rows themselves can differ: correct_event_order may split an event into separate exchange and local rows.
+        self.assertEqual(_sides(kept), _sides(plain))
+        self.assertEqual(plain_positions, [0.0, 1.0])
+        self.assertEqual(kept_positions, [0.0, 1.0])
+        # Control: the same print as a MARKET trade fills the bid at once.
+        self.assertEqual(as_trade_positions, [1.0, 1.0])
 
 
 if __name__ == '__main__':
